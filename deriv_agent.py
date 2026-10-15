@@ -1,11 +1,8 @@
-import asyncio
 import json
-import ssl
-
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
-import websockets
 
 # ==========================================
 # PAGE CONFIGURATION & UI SETUP
@@ -91,10 +88,7 @@ if "trade_history" not in st.session_state:
 # TECHNICAL & SMC ANALYSIS ENGINE
 # ==========================================
 def analyze_smc_market(df):
-    """
-    Calculates a simplified POC estimate, detects Fair Value Gaps,
-    and outputs a market signal.
-    """
+    """Calculates POC estimate, detects Fair Value Gaps, and outputs a signal."""
     required_columns = {"open", "high", "low", "close"}
 
     if not required_columns.issubset(df.columns):
@@ -108,7 +102,7 @@ def analyze_smc_market(df):
     if len(df) < 30:
         return {
             "signal": "HOLD",
-            "reason": "Insufficient candles: at least 30 are required",
+            "reason": "Insufficient candles: at least 30 required",
             "poc": None,
             "price": None,
         }
@@ -130,7 +124,7 @@ def analyze_smc_market(df):
             "price": None,
         }
 
-    # 1. Approximate price distribution / POC
+    # 1. Price distribution / POC
     price_bins = pd.cut(df["close"], bins=10)
     bin_counts = price_bins.value_counts()
 
@@ -180,17 +174,33 @@ def analyze_smc_market(df):
 
 
 # ==========================================
-# DERIV WEBSOCKET EXECUTION ENGINE
+# REST API HTTP EXECUTION ENGINE
 # ==========================================
-async def execute_trade(
-    websocket,
-    symbol,
-    contract_type,
-    stake,
-    multiplier,
-):
-    """Requests a multiplier proposal and buys contract."""
-    proposal_req = {
+def send_deriv_request(payload):
+    """Sends HTTP REST request to Deriv API over standard HTTPS."""
+    url = f"https://api.deriv.com/api/v1?app_id={app_id.strip()}"
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        response = requests.post(
+            url, data=json.dumps(payload), headers=headers, timeout=10
+        )
+        return response.json()
+    except Exception as e:
+        return {"error": {"message": f"HTTP Request Failed: {e}"}}
+
+
+def execute_trade_http(symbol, contract_type, stake, multiplier, token):
+    """Submits multiplier order over HTTPS."""
+    # Step 1: Proposal
+    prop_payload = {
         "proposal": 1,
         "amount": float(stake),
         "basis": "stake",
@@ -198,38 +208,40 @@ async def execute_trade(
         "currency": "USD",
         "symbol": symbol,
         "multiplier": int(multiplier),
+        "authorize": token,
     }
 
-    await websocket.send(json.dumps(proposal_req))
-    proposal_response = json.loads(await websocket.recv())
+    prop_res = send_deriv_request(prop_payload)
 
-    if "error" in proposal_response:
+    if "error" in prop_res:
         st.error(
             "Proposal error: "
-            + proposal_response["error"].get("message", "Unknown API error")
+            + prop_res["error"].get("message", "Unknown error")
         )
         return None
 
-    proposal = proposal_response.get("proposal")
-
+    proposal = prop_res.get("proposal")
     if not proposal or "id" not in proposal:
         st.error("No valid proposal returned.")
         return None
 
-    proposal_id = proposal["id"]
-    buy_req = {"buy": proposal_id, "price": float(stake)}
+    # Step 2: Buy
+    buy_payload = {
+        "buy": proposal["id"],
+        "price": float(stake),
+        "authorize": token,
+    }
 
-    await websocket.send(json.dumps(buy_req))
-    buy_response = json.loads(await websocket.recv())
+    buy_res = send_deriv_request(buy_payload)
 
-    if "error" in buy_response:
+    if "error" in buy_res:
         st.error(
             "Purchase error: "
-            + buy_response["error"].get("message", "Unknown API error")
+            + buy_res["error"].get("message", "Unknown error")
         )
         return None
 
-    return buy_response
+    return buy_res
 
 
 # ==========================================
@@ -252,7 +264,7 @@ st.warning(
 start_agent = st.button("🚀 Start Multiplier Agent")
 
 # ==========================================
-# AGENT RUNNER WITH WEBSOCKET FALLBACK
+# AGENT RUNNER
 # ==========================================
 if start_agent:
 
@@ -266,123 +278,47 @@ if start_agent:
         st.error("Profit lock is active. Reset session state before starting.")
 
     else:
-        st.info("Initiating secure WebSocket connection to Deriv API...")
+        st.info("Connecting to Deriv via HTTP REST API...")
 
-        async def run_agent_loop():
-            # Create SSL context to prevent SSL handshake rejections
-            ssl_context = ssl.create_default_context()
+        # 1. Authorize Token
+        auth_payload = {"authorize": api_token.strip()}
+        auth_res = send_deriv_request(auth_payload)
 
-            # Custom browser headers to satisfy Cloudflare filters
-            custom_headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Origin": "https://app.deriv.com",
+        if "error" in auth_res:
+            st.error(
+                "Authorization failed: "
+                + auth_res["error"].get("message", "Unknown API error")
+            )
+        else:
+            st.success("Successfully authenticated with Deriv via HTTPS!")
+
+            # 2. Fetch Candle Data
+            granularity = 60 if "1m" in trading_mode else 300
+            ticks_payload = {
+                "ticks_history": symbol,
+                "adjust_start_time": 1,
+                "count": 50,
+                "end": "latest",
+                "style": "candles",
+                "granularity": granularity,
             }
 
-            clean_app_id = app_id.strip()
+            candles_res = send_deriv_request(ticks_payload)
 
-            endpoints = [
-                f"wss://ws.derivws.com/websockets/v3?app_id={clean_app_id}",
-                f"wss://ws.binaryws.com/websockets/v3?app_id={clean_app_id}",
-            ]
-
-            ws = None
-            connected = False
-
-            for url in endpoints:
-                try:
-                    # Attempt connection with additional_headers (newer websockets versions)
-                    ws = await websockets.connect(
-                        url,
-                        ssl=ssl_context,
-                        additional_headers=custom_headers,
-                        ping_interval=20,
-                        ping_timeout=20,
-                    )
-                    connected = True
-                    break
-                except TypeError:
-                    # Fallback attempt with extra_headers (older websockets versions)
-                    try:
-                        ws = await websockets.connect(
-                            url,
-                            ssl=ssl_context,
-                            extra_headers=custom_headers,
-                            ping_interval=20,
-                            ping_timeout=20,
-                        )
-                        connected = True
-                        break
-                    except Exception as inner_err:
-                        st.warning(
-                            f"Unable to connect to `{url}` via fallback: {inner_err}"
-                        )
-                except Exception as conn_err:
-                    st.warning(f"Unable to connect to `{url}`: {conn_err}")
-                    await asyncio.sleep(1)
-
-            if not connected or ws is None:
+            if "error" in candles_res:
                 st.error(
-                    "❌ All Connection Attempts Failed!\n\n"
-                    "**Troubleshooting Checklist:**\n"
-                    "1. Run `pip install --upgrade websockets` in your terminal.\n"
-                    "2. Check if your firewall or network blocks outgoing WebSocket (`wss://`) traffic.\n"
-                    "3. If using a VPN, try toggling it off or changing servers."
+                    "Candle fetch failed: "
+                    + candles_res["error"].get("message", "Unknown error")
                 )
-                return
+            else:
+                candles = candles_res.get("candles", [])
 
-            try:
-                async with ws:
-                    # 1. Authorize account
-                    await ws.send(json.dumps({"authorize": api_token.strip()}))
-                    auth_response = json.loads(await ws.recv())
-
-                    if "error" in auth_response:
-                        st.error(
-                            "Authorization failed: "
-                            + auth_response["error"].get(
-                                "message", "Unknown API error"
-                            )
-                        )
-                        return
-
-                    st.success("Successfully authenticated with Deriv.")
-
-                    # 2. Request historical candles
-                    granularity = 60 if "1m" in trading_mode else 300
-                    ticks_req = {
-                        "ticks_history": symbol,
-                        "adjust_start_time": 1,
-                        "count": 50,
-                        "end": "latest",
-                        "style": "candles",
-                        "granularity": granularity,
-                    }
-
-                    await ws.send(json.dumps(ticks_req))
-                    candles_response = json.loads(await ws.recv())
-
-                    if "error" in candles_response:
-                        st.error(
-                            "Candle request failed: "
-                            + candles_response["error"].get(
-                                "message", "Unknown API error"
-                            )
-                        )
-                        return
-
-                    candles = candles_response.get("candles", [])
-
-                    if not candles:
-                        st.warning("No historical candles returned.")
-                        return
-
+                if not candles:
+                    st.warning("No historical candles returned.")
+                else:
                     df = pd.DataFrame(candles)
 
-                    # 3. Analyze market
+                    # 3. Analyze Market
                     smc_res = analyze_smc_market(df)
 
                     st.subheader("Market Analysis Output")
@@ -403,31 +339,29 @@ if start_agent:
                         f"**Reason:** {smc_res['reason']}"
                     )
 
-                    # 4. Check local PnL safeguards
+                    # 4. Check Local Safeguards
                     pnl = st.session_state.daily_pnl
 
                     if pnl >= daily_target:
                         st.session_state.profit_lock_active = True
                         st.warning("Daily profit target reached. Trading halted.")
-                        return
 
-                    if pnl <= -max_daily_loss:
+                    elif pnl <= -max_daily_loss:
                         st.error("Daily loss limit hit. Trading halted.")
-                        return
 
-                    # 5. Execute trade if signal exists
-                    if smc_res["signal"] in ("MULTUP", "MULTDOWN"):
+                    # 5. Execute Trade
+                    elif smc_res["signal"] in ("MULTUP", "MULTDOWN"):
                         st.write(
                             f"Executing signal: **{smc_res['signal']}** "
                             f"at {multiplier_val}x multiplier..."
                         )
 
-                        trade_result = await execute_trade(
-                            ws,
+                        trade_result = execute_trade_http(
                             symbol,
                             smc_res["signal"],
                             stake_amount,
                             multiplier_val,
+                            api_token.strip(),
                         )
 
                         if trade_result is not None:
@@ -437,11 +371,6 @@ if start_agent:
 
                     else:
                         st.info("No qualifying SMC signal. No trade executed.")
-
-            except Exception as exc:
-                st.error(f"Agent Runtime Error: {exc}")
-
-        asyncio.run(run_agent_loop())
 
 # ==========================================
 # TRADE HISTORY
